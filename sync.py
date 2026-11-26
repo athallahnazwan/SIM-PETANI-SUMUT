@@ -1,210 +1,118 @@
-import streamlit as st
-import pandas as pd
+import os
 import psycopg2
-import plotly.express as px
+from psycopg2.extras import execute_values
 
+DB_KARO = os.environ.get("DB_KARO")
+DB_DELI = os.environ.get("DB_DELI")
+DB_LANGKAT = os.environ.get("DB_LANGKAT")
+DB_PUSAT = os.environ.get("DB_PUSAT")
 
-# ==========================================
-# 1. KONFIGURASI WEBSITE
-# ==========================================
+KONEKSI_KABUPATEN = {
+    "KARO": DB_KARO,
+    "DELI SERDANG": DB_DELI,
+    "LANGKAT": DB_LANGKAT,
+}
 
-st.set_page_config(
-    page_title="SIM-PETANI SUMUT",
-    page_icon="🌾",
-    layout="wide"
+if not all(KONEKSI_KABUPATEN.values()) or not DB_PUSAT:
+    raise ValueError(
+        "Salah satu secret database (DB_KARO, DB_DELI, DB_LANGKAT, DB_PUSAT) kosong."
+    )
+
+SQL_BUAT_TABEL_PUSAT = """
+CREATE TABLE IF NOT EXISTS petani_pusat (
+    kode_petani VARCHAR(20) PRIMARY KEY,
+    nama_petani VARCHAR(100) NOT NULL,
+    desa VARCHAR(100) NOT NULL,
+    komoditas VARCHAR(100) NOT NULL,
+    luas_lahan NUMERIC(8,2) NOT NULL,
+    wilayah_sumber VARCHAR(50) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+SQL_UPSERT_PUSAT = """
+INSERT INTO petani_pusat (
+    kode_petani,
+    nama_petani,
+    desa,
+    komoditas,
+    luas_lahan,
+    wilayah_sumber,
+    updated_at
 )
-
-st.markdown("""
-<style>
-.main {
-    background-color: #f5f7fa;
-}
-
-[data-testid="stMetric"] {
-    background: white;
-    padding: 18px;
-    border-radius: 12px;
-    border: 1px solid #e5e7eb;
-}
-
-</style>
-""", unsafe_allow_html=True)
+VALUES %s
+ON CONFLICT (kode_petani)
+DO UPDATE SET
+    nama_petani = EXCLUDED.nama_petani,
+    desa = EXCLUDED.desa,
+    komoditas = EXCLUDED.komoditas,
+    luas_lahan = EXCLUDED.luas_lahan,
+    wilayah_sumber = EXCLUDED.wilayah_sumber,
+    updated_at = EXCLUDED.updated_at;
+"""
 
 
-# ==========================================
-# 2. KONEKSI DATABASE DATA WAREHOUSE
-# ==========================================
-
-def get_database_url():
-
+def ambil_data_kabupaten(connection_string, wilayah):
+    conn = psycopg2.connect(connection_string, sslmode="require")
     try:
-        return st.secrets["datawarehouse"]["url"]
-
-    except KeyError:
-        st.error(
-            "Konfigurasi Data Warehouse tidak ditemukan. "
-            "Periksa Secrets Streamlit Cloud: "
-            "[datawarehouse] dan url."
-        )
-        st.stop()
-
-
-def read_data(query, params=None):
-
-    conn = None
-
-    try:
-
-        database_url = get_database_url()
-
-        conn = psycopg2.connect(
-            database_url,
-            connect_timeout=20,
-            sslmode="require",
-            application_name="SIM_PETANI_SUMUT"
-        )
-
         with conn.cursor() as cur:
-
-            cur.execute(query, params)
-
-            # Mendapatkan nama kolom
-            columns = [
-                description[0]
-                for description in cur.description
-            ]
-
-            # Mengambil data
+            cur.execute("""
+                SELECT
+                    kode_petani,
+                    nama_petani,
+                    desa,
+                    komoditas,
+                    luas_lahan,
+                    updated_at
+                FROM petani;
+            """)
             rows = cur.fetchall()
-
-            # Mengubah hasil menjadi Pandas DataFrame
-            df = pd.DataFrame(
-                rows,
-                columns=columns
-            )
-
-        return df
-
-    except psycopg2.Error as e:
-
-        st.error(
-            f"Database Error: {type(e).__name__}: {e}"
-        )
-
-        raise
-
-    except Exception as e:
-
-        st.error(
-            f"Application Error: {type(e).__name__}: {e}"
-        )
-
-        raise
-
+        print(f"{wilayah}: {len(rows)} baris dibaca dari tabel petani")
+        return [(wilayah, row) for row in rows]
     finally:
-
-        if conn is not None:
-            conn.close()
+        conn.close()
 
 
-# ==========================================
-# 3. HEADER
-# ==========================================
+def main():
+    semua_data_pusat = []
 
-st.title("🌾 SIM-PETANI SUMATERA UTARA")
+    for wilayah, conn_str in KONEKSI_KABUPATEN.items():
+        semua_data_pusat.extend(ambil_data_kabupaten(conn_str, wilayah))
 
-st.markdown("""
-**Sistem Informasi Pemetaan Petani dan Penyuluh
-Provinsi Sumatera Utara**
+    kode_ditemukan = [row[1][0] for row in semua_data_pusat]
+    if len(kode_ditemukan) != len(set(kode_ditemukan)):
+        raise ValueError("Ada kode_petani duplikat antar database kabupaten.")
 
-Government Agricultural Data Dashboard
-""")
+    if not semua_data_pusat:
+        print("Tidak ada data ditemukan di database kabupaten. Proses dilewati.")
+        return
 
-st.divider()
-
-
-# ==========================================
-# 4. AMBIL TANGGAL SNAPSHOT
-# ==========================================
-
-dates = read_data("""
-    SELECT DISTINCT id_tanggal
-    FROM dw.fact_petani_harian
-    ORDER BY id_tanggal DESC
-""")
-
-if dates.empty:
-
-    st.warning(
-        "Belum terdapat data pada Data Warehouse."
-    )
-
-    st.stop()
-
-
-date_options = dates["id_tanggal"].tolist()
-
-selected_date = st.sidebar.selectbox(
-    "Pilih Tanggal Snapshot",
-    date_options
-)
-
-
-# ==========================================
-# 5. SIDEBAR NAVIGASI
-# ==========================================
-
-menu = st.sidebar.radio(
-    "MENU NAVIGASI",
-    [
-        "Dashboard Utama",
-        "Statistik Kabupaten",
-        "Statistik Komoditas",
-        "Data Petani"
+    nilai_pusat = [
+        (
+            row[0],    # kode_petani
+            row[1],    # nama_petani
+            row[2],    # desa
+            row[3],    # komoditas
+            row[4],    # luas_lahan
+            wilayah,   # wilayah_sumber
+            row[5],    # updated_at
+        )
+        for wilayah, row in semua_data_pusat
     ]
-)
+
+    conn = psycopg2.connect(DB_PUSAT, sslmode="require")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(SQL_BUAT_TABEL_PUSAT)
+            execute_values(cur, SQL_UPSERT_PUSAT, nilai_pusat)
+        conn.commit()
+        print(f"SINKRONISASI BERHASIL: {len(nilai_pusat)} baris diproses ke petani_pusat.")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-# ==========================================
-# 6. DASHBOARD UTAMA
-# ==========================================
-
-if menu == "Dashboard Utama":
-
-    summary = read_data("""
-        SELECT
-            COUNT(*) AS total_petani,
-            COALESCE(SUM(luas_lahan), 0) AS total_luas,
-            COUNT(DISTINCT wilayah_sumber) AS total_kabupaten,
-            COUNT(DISTINCT id_komoditas) AS total_komoditas
-        FROM dw.fact_petani_harian
-        WHERE id_tanggal = %s
-    """, (selected_date,))
-
-    if summary.empty:
-        st.warning("Data ringkasan tidak tersedia.")
-        st.stop()
-
-    r = summary.iloc[0]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Total Petani",
-        f"{int(r.total_petani):,}"
-    )
-
-    c2.metric(
-        "Luas Lahan",
-        f"{float(r.total_luas):,.2f} Ha"
-    )
-
-    c3.metric(
-        "Kabupaten",
-        int(r.total_kabupaten)
-    )
-
-    c4.metric(
-        "Komoditas",
-        int(r.total_komoditas)
-    )
+if __name__ == "__main__":
+    main()
